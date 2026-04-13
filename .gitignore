@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+spark-warehouse/
+derby.log
+metastore_db/
+data/sample/*.csv
+.DS_Store

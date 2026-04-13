@@ -1,0 +1,396 @@
+
+
+# Create new one with working images
+#version: "3.8"
+
+# ─────────────────────────────────────────────────────────────
+# Project Atlas — Local Development Stack
+# Uses official Apache Spark image instead of Bitnami
+# ─────────────────────────────────────────────────────────────
+
+networks:
+  atlas-network:
+    driver: bridge
+
+volumes:
+  minio-data:
+  mongodb-data:
+  postgres-data:
+
+services:
+
+  # ───────────────────────────────────────────────────────────
+  # SPARK MASTER
+  # Official Apache Spark image — more widely available
+  # UI at http://localhost:8080
+  # ───────────────────────────────────────────────────────────
+  spark-master:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    container_name: atlas-spark-master
+    # Tell Spark to run in master mode
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    environment:
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_MASTER_PORT=7077
+      - SPARK_MASTER_WEBUI_PORT=8080
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    networks:
+      - atlas-network
+    volumes:
+      - ./notebooks:/opt/notebooks
+      - ./data:/opt/data
+      # Mount local spark-jars folder into container
+      - ./spark-jars:/opt/spark/extra-jars
+
+  # ───────────────────────────────────────────────────────────
+  # SPARK WORKER
+  # Connects to master and does the actual processing
+  # UI at http://localhost:8081
+  # ───────────────────────────────────────────────────────────
+  spark-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    container_name: atlas-spark-worker
+    # Tell Spark to run in worker mode and connect to master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    environment:
+      - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_WEBUI_PORT=8081
+    ports:
+      - "8081:8081"
+    networks:
+      - atlas-network
+    volumes:
+      - ./notebooks:/opt/notebooks
+      - ./data:/opt/data
+      # Mount local spark-jars folder into container
+      - ./spark-jars:/opt/spark/extra-jars
+    depends_on:
+      - spark-master
+
+  # ───────────────────────────────────────────────────────────
+  # JUPYTERLAB WITH PYSPARK
+  # Using jupyter/all-spark-notebook which includes
+  # PySpark and Delta Lake pre-installed
+  # Open http://localhost:8888 — token: atlas2024
+  # ───────────────────────────────────────────────────────────
+  jupyter:
+    image: jupyter/all-spark-notebook:latest
+    container_name: atlas-jupyter
+    env_file:
+      - .env
+    environment:
+      - JUPYTER_TOKEN=atlas2024
+      # Connect to our Spark master
+      - SPARK_MASTER=spark://spark-master:7077
+      # MinIO credentials — used in notebooks
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ACCESS_KEY=atlasadmin
+      - MINIO_SECRET_KEY=atlaspassword123
+      # MongoDB connection
+      - MONGODB_URI=mongodb://atlasadmin:atlaspassword123@mongodb:27017
+      # PostgreSQL connection
+      - POSTGRES_URI=postgresql://atlasadmin:atlaspassword123@postgres:5432/atlas_gold
+    ports:
+      - "8888:8888"
+    networks:
+      - atlas-network
+    volumes:
+      - ./notebooks:/home/jovyan/work/notebooks
+      - ./src:/home/jovyan/work/src
+      - ./data:/home/jovyan/work/data
+      - ./spark-jars:/home/jovyan/extra-jars
+    depends_on:
+      - spark-master
+      - minio
+      - mongodb
+      - postgres
+
+  # ───────────────────────────────────────────────────────────
+  # MINIO — local Azure Data Lake Storage Gen2
+  # Stores Bronze Silver Gold Parquet files
+  # API at http://localhost:9000
+  # Console at http://localhost:9001
+  # ───────────────────────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: atlas-minio
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=atlasadmin
+      - MINIO_ROOT_PASSWORD=atlaspassword123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      - atlas-network
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ───────────────────────────────────────────────────────────
+  # MINIO SETUP
+  # Creates bronze silver gold quarantine buckets
+  # Runs once on startup then exits — that is correct
+  # ───────────────────────────────────────────────────────────
+  minio-setup:
+    image: minio/mc:latest
+    container_name: atlas-minio-setup
+    entrypoint: >
+      /bin/sh -c "
+      echo 'Waiting for MinIO...';
+      sleep 10;
+      mc alias set atlas http://minio:9000 atlasadmin atlaspassword123;
+      mc mb atlas/bronze --ignore-existing;
+      mc mb atlas/silver --ignore-existing;
+      mc mb atlas/gold --ignore-existing;
+      mc mb atlas/quarantine --ignore-existing;
+      echo 'All buckets created';
+      exit 0;
+      "
+    networks:
+      - atlas-network
+    depends_on:
+      - minio
+
+  # ───────────────────────────────────────────────────────────
+  # MONGODB — local Cosmos DB equivalent
+  # Stores pipeline audit logs and idempotency records
+  # Port 27017
+  # ───────────────────────────────────────────────────────────
+  mongodb:
+    image: mongo:7.0
+    container_name: atlas-mongodb
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=atlasadmin
+      - MONGO_INITDB_ROOT_PASSWORD=atlaspassword123
+      - MONGO_INITDB_DATABASE=atlas_pipeline
+    ports:
+      - "27017:27017"
+    networks:
+      - atlas-network
+    volumes:
+      - mongodb-data:/data/db
+
+  # ───────────────────────────────────────────────────────────
+  # POSTGRESQL — local Synapse Analytics equivalent
+  # Stores Gold layer aggregations for Power BI
+  # Port 5432
+  # ───────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16
+    container_name: atlas-postgres
+    environment:
+      - POSTGRES_USER=atlasadmin
+      - POSTGRES_PASSWORD=atlaspassword123
+      - POSTGRES_DB=atlas_gold
+    ports:
+      - "5432:5432"
+    networks:
+      - atlas-network
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./src/sql:/docker-entrypoint-initdb.d
+
+
+  # ───────────────────────────────────────────────────────────
+  # ZOOKEEPER
+  # Kafka cannot run without Zookeeper
+  # Zookeeper manages the Kafka cluster state
+  # Tracks which brokers are alive
+  # Manages leader election for partitions
+  # In newer Kafka versions (KRaft mode) Zookeeper
+  # is not needed — but we use classic mode for compatibility
+  # ───────────────────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: atlas-zookeeper
+    environment:
+      # Zookeeper client port — Kafka connects here
+      ZOOKEEPER_CLIENT_PORT: 2181
+      # How often Zookeeper sends heartbeat ticks in ms
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - atlas-network
+    # Health check — wait until Zookeeper accepts connections
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ───────────────────────────────────────────────────────────
+  # KAFKA BROKER
+  # The message broker — heart of our streaming architecture
+  # Receives messages from bank simulators
+  # Buffers them until Spark consumes them
+  # Three topics — one per bank
+  #
+  # Two listeners — this is important:
+  #   PLAINTEXT://kafka:29092  — for containers inside Docker
+  #   PLAINTEXT_HOST://localhost:9092 — for apps on your laptop
+  # ───────────────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: atlas-kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      # Connect to Zookeeper
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+
+      # Two listeners — internal Docker and external laptop
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+
+      # This broker's ID — unique in the cluster
+      # We only have one broker — ID is 1
+      KAFKA_BROKER_ID: 1
+
+      # How many replicas for internal Kafka topics
+      # 1 = fine for development, 3 = production minimum
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
+      # How long to keep messages — 7 days
+      # After 7 days old messages are deleted
+      # In production financial systems — 30 days minimum
+      KAFKA_LOG_RETENTION_HOURS: 168
+
+      # Auto create topics when producer first sends to them
+      # Convenient for development
+      # In production set to false — create topics explicitly
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+
+      # Default number of partitions per topic
+      # More partitions = more parallelism
+      # 3 partitions = 3 Spark tasks can read simultaneously
+      KAFKA_NUM_PARTITIONS: 3
+    ports:
+      # External port — connect from your laptop
+      - "9092:9092"
+      # Internal port — used by containers
+      - "29092:29092"
+    networks:
+      - atlas-network
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # ───────────────────────────────────────────────────────────
+  # KAFKA UI
+  # Visual interface to monitor Kafka
+  # See topics, messages, consumer groups, lag
+  # Open http://localhost:8090
+  # ───────────────────────────────────────────────────────────
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: atlas-kafka-ui
+    environment:
+      # Connect to our Kafka broker
+      KAFKA_CLUSTERS_0_NAME: atlas-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    ports:
+      # Open http://localhost:8090 to see Kafka UI
+      - "8090:8080"
+    networks:
+      - atlas-network
+    depends_on:
+      - kafka
+
+  # ───────────────────────────────────────────────────────────
+  # BANK PKO SIMULATOR
+  # Simulates PKO Bank Polski — Poland's largest bank
+  # Sends 1 transaction every 2 seconds
+  # 5% fraud rate
+  # Topic: bank.pko.transactions
+  # ───────────────────────────────────────────────────────────
+  bank-pko:
+    build:
+      context: ./src/simulators
+      dockerfile: Dockerfile
+    container_name: atlas-bank-pko
+    environment:
+      - KAFKA_BROKER=kafka:29092
+      - KAFKA_TOPIC=bank.pko.transactions
+      - BANK_CODE=PKO
+      - BANK_NAME=PKO Bank Polski
+      - SEND_INTERVAL=2.0
+      - FRAUD_RATE=0.05
+    networks:
+      - atlas-network
+    depends_on:
+      kafka:
+        condition: service_healthy
+    # Restart automatically if simulator crashes
+    restart: unless-stopped
+
+  # ───────────────────────────────────────────────────────────
+  # BANK MBANK SIMULATOR
+  # Simulates mBank — popular online bank in Poland
+  # Sends 1 transaction every 3 seconds — slightly slower
+  # 8% fraud rate — higher risk profile
+  # Topic: bank.mbank.transactions
+  # ───────────────────────────────────────────────────────────
+  bank-mbank:
+    build:
+      context: ./src/simulators
+      dockerfile: Dockerfile
+    container_name: atlas-bank-mbank
+    environment:
+      - KAFKA_BROKER=kafka:29092
+      - KAFKA_TOPIC=bank.mbank.transactions
+      - BANK_CODE=MBANK
+      - BANK_NAME=mBank
+      - SEND_INTERVAL=3.0
+      - FRAUD_RATE=0.08
+    networks:
+      - atlas-network
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ───────────────────────────────────────────────────────────
+  # BANK ING SIMULATOR
+  # Simulates ING Bank Slaski
+  # Sends 1 transaction every 1.5 seconds — fastest
+  # 3% fraud rate — lowest risk profile
+  # Topic: bank.ing.transactions
+  # ───────────────────────────────────────────────────────────
+  bank-ing:
+    build:
+      context: ./src/simulators
+      dockerfile: Dockerfile
+    container_name: atlas-bank-ing
+    environment:
+      - KAFKA_BROKER=kafka:29092
+      - KAFKA_TOPIC=bank.ing.transactions
+      - BANK_CODE=ING
+      - BANK_NAME=ING Bank Slaski
+      - SEND_INTERVAL=1.5
+      - FRAUD_RATE=0.03
+    networks:
+      - atlas-network
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
