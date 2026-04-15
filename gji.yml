@@ -1,0 +1,195 @@
+
+
+# Create new one with working images
+#version: "3.8"
+
+# ─────────────────────────────────────────────────────────────
+# Project Atlas — Local Development Stack
+# Uses official Apache Spark image instead of Bitnami
+# ─────────────────────────────────────────────────────────────
+
+networks:
+  atlas-network:
+    driver: bridge
+
+volumes:
+  minio-data:
+  mongodb-data:
+  postgres-data:
+
+services:
+
+  # ───────────────────────────────────────────────────────────
+  # SPARK MASTER
+  # Official Apache Spark image — more widely available
+  # UI at http://localhost:8080
+  # ───────────────────────────────────────────────────────────
+  spark-master:
+    image: apache/spark:3.5.1
+    container_name: atlas-spark-master
+    # Tell Spark to run in master mode
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    environment:
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_MASTER_PORT=7077
+      - SPARK_MASTER_WEBUI_PORT=8080
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    networks:
+      - atlas-network
+    volumes:
+      - ./notebooks:/opt/notebooks
+      - ./data:/opt/data
+
+  # ───────────────────────────────────────────────────────────
+  # SPARK WORKER
+  # Connects to master and does the actual processing
+  # UI at http://localhost:8081
+  # ───────────────────────────────────────────────────────────
+  spark-worker:
+    image: apache/spark:3.5.1
+    container_name: atlas-spark-worker
+    # Tell Spark to run in worker mode and connect to master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    environment:
+      - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_WEBUI_PORT=8081
+    ports:
+      - "8081:8081"
+    networks:
+      - atlas-network
+    volumes:
+      - ./notebooks:/opt/notebooks
+      - ./data:/opt/data
+    depends_on:
+      - spark-master
+
+  # ───────────────────────────────────────────────────────────
+  # JUPYTERLAB WITH PYSPARK
+  # Using jupyter/all-spark-notebook which includes
+  # PySpark and Delta Lake pre-installed
+  # Open http://localhost:8888 — token: atlas2024
+  # ───────────────────────────────────────────────────────────
+  jupyter:
+    image: jupyter/all-spark-notebook:latest
+    container_name: atlas-jupyter
+    env_file:
+      - .env
+    environment:
+      - JUPYTER_TOKEN=atlas2024
+      # Connect to our Spark master
+      - SPARK_MASTER=spark://spark-master:7077
+      # MinIO credentials — used in notebooks
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ACCESS_KEY=atlasadmin
+      - MINIO_SECRET_KEY=atlaspassword123
+      # MongoDB connection
+      - MONGODB_URI=mongodb://atlasadmin:atlaspassword123@mongodb:27017
+      # PostgreSQL connection
+      - POSTGRES_URI=postgresql://atlasadmin:atlaspassword123@postgres:5432/atlas_gold
+    ports:
+      - "8888:8888"
+    networks:
+      - atlas-network
+    volumes:
+      - ./notebooks:/home/jovyan/work/notebooks
+      - ./src:/home/jovyan/work/src
+      - ./data:/home/jovyan/work/data
+    depends_on:
+      - spark-master
+      - minio
+      - mongodb
+      - postgres
+
+  # ───────────────────────────────────────────────────────────
+  # MINIO — local Azure Data Lake Storage Gen2
+  # Stores Bronze Silver Gold Parquet files
+  # API at http://localhost:9000
+  # Console at http://localhost:9001
+  # ───────────────────────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: atlas-minio
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=atlasadmin
+      - MINIO_ROOT_PASSWORD=atlaspassword123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      - atlas-network
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ───────────────────────────────────────────────────────────
+  # MINIO SETUP
+  # Creates bronze silver gold quarantine buckets
+  # Runs once on startup then exits — that is correct
+  # ───────────────────────────────────────────────────────────
+  minio-setup:
+    image: minio/mc:latest
+    container_name: atlas-minio-setup
+    entrypoint: >
+      /bin/sh -c "
+      echo 'Waiting for MinIO...';
+      sleep 10;
+      mc alias set atlas http://minio:9000 atlasadmin atlaspassword123;
+      mc mb atlas/bronze --ignore-existing;
+      mc mb atlas/silver --ignore-existing;
+      mc mb atlas/gold --ignore-existing;
+      mc mb atlas/quarantine --ignore-existing;
+      echo 'All buckets created';
+      exit 0;
+      "
+    networks:
+      - atlas-network
+    depends_on:
+      - minio
+
+  # ───────────────────────────────────────────────────────────
+  # MONGODB — local Cosmos DB equivalent
+  # Stores pipeline audit logs and idempotency records
+  # Port 27017
+  # ───────────────────────────────────────────────────────────
+  mongodb:
+    image: mongo:7.0
+    container_name: atlas-mongodb
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=atlasadmin
+      - MONGO_INITDB_ROOT_PASSWORD=atlaspassword123
+      - MONGO_INITDB_DATABASE=atlas_pipeline
+    ports:
+      - "27017:27017"
+    networks:
+      - atlas-network
+    volumes:
+      - mongodb-data:/data/db
+
+  # ───────────────────────────────────────────────────────────
+  # POSTGRESQL — local Synapse Analytics equivalent
+  # Stores Gold layer aggregations for Power BI
+  # Port 5432
+  # ───────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16
+    container_name: atlas-postgres
+    environment:
+      - POSTGRES_USER=atlasadmin
+      - POSTGRES_PASSWORD=atlaspassword123
+      - POSTGRES_DB=atlas_gold
+    ports:
+      - "5432:5432"
+    networks:
+      - atlas-network
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./src/sql:/docker-entrypoint-initdb.d
+
