@@ -9,3 +9,4 @@ derby.log
 metastore_db/
 data/sample/*.csv
 .DS_Store
+gji.yml
